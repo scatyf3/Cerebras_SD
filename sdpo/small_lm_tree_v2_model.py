@@ -1116,62 +1116,32 @@ class SmallLMTreeV2Model(nn.Module):
         mask = torch.zeros(allowed.shape, device=device, dtype=dtype)
         return mask.masked_fill_(~allowed, torch.finfo(dtype).min).unsqueeze(1)
 
-    def _rollout_batch(self, batch_idx, anchor_pos,
-                       drf_anchor_logits, tgt_anchor_logits,
-                       drf_keys, drf_values, tgt_keys, tgt_values,
-                       temperature, eal_mode="budget", path_topk=16,
-                       eal_score_coef=0.1, anchor_group=None,
-                       anchor_kl_coef=0.0, path_eal_weights=None,
-                       path_eal_mean=False, path_eal_var_coef=0.0,
-                       tree_kl_w=None, tree_eal_w=None):
-        """Greedy top-k tree, global budget prune, batched across the microbatch.
-
-        Returns mean KL over kept nodes and mean Tree-EAL. KL carries the draft
-        gradient. Tree-EAL uses target acceptance probabilities.
-        """
-        device = drf_anchor_logits.device
-        B = len(batch_idx)
+    def _grow_tree(self, drf_root, T, sample_tree, skip_full_logits, step_logits, rec):
+        """Grow the draft trees depth by depth. step_logits(d_step, tokens [B, n])
+        returns the draft logits [B, n, V] of the depth-(d_step-1) nodes. rec
+        records the decisions (sampled / top-k tokens, budget prune) on the first
+        call and replays them when passed back, so a second call on replayed
+        logits rebuilds the same trees with the gradient attached."""
+        B = drf_root.size(0)
         gamma = self.gamma
         top_k = self.top_k_per_depth
         depth_counts = self.tree_depth_counts
-        depth_starts = self.tree_depth_starts
-        kv_lens = [ap + 1 for ap in anchor_pos]
-        T = max(float(temperature), 1e-6)
-
-        a_t = torch.tensor(anchor_pos, device=device, dtype=torch.long)
-
-        # forest: all trees in one sequence on a shared prefix KV (tree_forest.py).
-        # A single tree has nothing to share, so it keeps the batch layout.
-        forest = bool(getattr(self, "forest", False)) and B > 1
-        if forest:
-            max_kv = max(kv_lens)
-            drf_cache = tree_forest.pack_prefix(drf_keys, drf_values, max_kv)
-            pre_allowed = tree_forest.prefix_allowed(
-                batch_idx, kv_lens, max_kv, drf_keys[0].size(0), device)
-        else:
-            drf_cache, max_kv = _pad_cache_batch(drf_keys, drf_values, batch_idx, kv_lens)
-
-        # Already the anchor rows, shape [B, V]. Casting the full prefix
-        # logits to float32 does not fit on an 80GB H100.
-        drf_root = drf_anchor_logits.float()
-        tgt_root = tgt_anchor_logits.float()
         root_lp = F.log_softmax(drf_root, dim=-1)
-        # sample_minpq: the draft SAMPLES k distinct children per node at T,
-        # matching eval --draft-mode sample. Otherwise greedy top-k.
-        sample_tree = eal_mode in ("sample_minpq", "sample_anyk", "sample_cover")
-        if sample_tree:
+        if "root" in rec:
+            root_tok = rec["root"]
+            root_scores = root_lp.gather(-1, root_tok)
+        elif sample_tree:
             with torch.no_grad():
                 root_tok = torch.multinomial(
                     torch.softmax(drf_root / T, dim=-1), top_k[0], replacement=False)
             root_scores = root_lp.gather(-1, root_tok)
         else:
             root_scores, root_tok = root_lp.topk(top_k[0], dim=-1)
+        rec.setdefault("root", root_tok)
 
         tokens_per_depth = [root_tok]
         scores_per_depth = [root_scores]
         pred_per_depth = []
-        # soft_topk keeps the draft distribution so the accept length can train it.
-        skip_full_logits = eal_mode == "node_marginal"
         if not skip_full_logits:
             pred_per_depth.append(
                 drf_root.unsqueeze(1).expand(B, top_k[0], -1).contiguous())
@@ -1188,33 +1158,13 @@ class SmallLMTreeV2Model(nn.Module):
                 raise RuntimeError(
                     "budget prune before the last depth is not supported "
                     f"(depth {d_step - 1}: {n_in} != {depth_counts[d_step - 1]})")
-            pos = (a_t + d_step).view(B, 1).expand(B, n_in)
-            if forest:
-                # Forest columns: one tree-major block per depth 0..d_step-1, the
-                # last being the nodes this step appends.
-                tree = self._draft_step_tree_allowed(d_step, device)
-                blocks = [tree_forest.block_diag(
-                    tree[:, depth_starts[j]:depth_starts[j] + depth_counts[j]]
-                    .unsqueeze(0).expand(B, -1, -1)) for j in range(d_step)]
-                step_out = tree_forest.forward(
-                    self.draft_model, tokens_per_depth[-1].reshape(1, -1),
-                    pos.reshape(1, -1), tree_forest.forest_allowed(pre_allowed, blocks, n_in),
-                    drf_cache, use_cache=(d_step < gamma - 1))
-            else:
-                mask = self._draft_step_mask_batch(
-                    d_step, kv_lens, max_kv, device, self.draft_model.dtype)
-                step_out = self.draft_model(
-                    input_ids=tokens_per_depth[-1],
-                    attention_mask=mask,
-                    position_ids=pos,
-                    past_key_values=drf_cache,
-                    use_cache=(d_step < gamma - 1),
-                    return_dict=True,
-                )
-            depth_pred = step_out.logits.float().view(B, n_in, -1)
+            depth_pred = step_logits(d_step, tokens_per_depth[-1])
             child_lp = F.log_softmax(depth_pred, dim=-1)
             k = top_k[d_step]
-            if sample_tree:
+            if ("child", d_step) in rec:
+                child_tok = rec["child", d_step]
+                child_sc = child_lp.gather(-1, child_tok)
+            elif sample_tree:
                 with torch.no_grad():
                     flat_p = torch.softmax(depth_pred / T, dim=-1).reshape(B * n_in, -1)
                     child_tok = torch.multinomial(
@@ -1222,6 +1172,7 @@ class SmallLMTreeV2Model(nn.Module):
                 child_sc = child_lp.gather(-1, child_tok)
             else:
                 child_sc, child_tok = child_lp.topk(k, dim=-1)
+            rec.setdefault(("child", d_step), child_tok)
             cum = scores_per_depth[-1].unsqueeze(-1) + child_sc
             flat_tok = child_tok.reshape(B, -1)
             flat_sc = cum.reshape(B, -1)
@@ -1247,7 +1198,8 @@ class SmallLMTreeV2Model(nn.Module):
                     raise RuntimeError(
                         "budget prune before the last depth is not supported "
                         f"(depth {d_step}: keep {keep} of {n_cand})")
-                _, sel = flat_sc.topk(keep, dim=-1)
+                sel = rec["sel"] if "sel" in rec else flat_sc.topk(keep, dim=-1)[1]
+                rec.setdefault("sel", sel)
                 flat_tok = flat_tok.gather(1, sel)
                 flat_sc = flat_sc.gather(1, sel)
                 last_sel = sel
@@ -1258,8 +1210,193 @@ class SmallLMTreeV2Model(nn.Module):
                     flat_pred = flat_pred.gather(
                         1, sel.unsqueeze(-1).expand(B, keep, flat_pred.size(-1)))
                 pred_per_depth.append(flat_pred)
+
+        return dict(tokens_per_depth=tokens_per_depth, pred_per_depth=pred_per_depth,
+                    last_sel=last_sel, full_leaf_tok=full_leaf_tok,
+                    full_leaf_sc=full_leaf_sc, full_leaf_logp=full_leaf_logp,
+                    full_leaf_pred=full_leaf_pred, prefix_logp=prefix_logp)
+
+    def _forest_step_allowed(self, d_step, B, pre_allowed):
+        """Forest mask [B*n, P + B*depth_starts[d_step]] of the depth-(d_step-1)
+        nodes: own prefix up to the anchor, own ancestors and self, with one
+        tree-major column block per depth 0..d_step-1."""
+        tree = self._draft_step_tree_allowed(d_step, pre_allowed.device)
+        ds, dc = self.tree_depth_starts, self.tree_depth_counts
+        blocks = [tree_forest.block_diag(tree[:, ds[j]:ds[j] + dc[j]].unsqueeze(0).expand(B, -1, -1))
+                  for j in range(d_step)]
+        return tree_forest.forest_allowed(pre_allowed, blocks, dc[d_step - 1])
+
+    def _graph_engine(self, prefix_len, n_trees):
+        """CUDA-graph rollout engine sized for this forest (None → eager)."""
+        from tree_graph_rollout import GraphRolloutEngine, graph_capturable
+        if not graph_capturable(self.draft_model):
+            if not getattr(self, "_warned_graph", False):
+                print("[SmallLMTreeV2] draft params are ZeRO-3 partitioned → eager rollout")
+                self._warned_graph = True
+            return None
+        # Forest nodes the rollout caches, plus bucket padding of the last step.
+        need = prefix_len + n_trees * self.tree_depth_starts[-1] + 128
+        eng = getattr(self, "_engine", None)
+        if eng is None or eng.max_kv < need:
+            self._engine = None
+            torch.cuda.empty_cache()
+            self._engine = GraphRolloutEngine(self.draft_model,
+                                              max_kv=-(-max(need, 4096) // 1024) * 1024)
+        return self._engine
+
+    def _sample_then_replay(self, drf_root, T, sample_tree, skip_full_logits, a_t,
+                            pre_allowed, drf_keys, drf_values, max_kv, graph):
+        """--rollout replay / graph. Grow the forest under no_grad (CUDA graphs
+        with graph=True), recording every decision. Then ONE draft forward with
+        the gradient over every node the rollout forwarded (depths 0..gamma-2,
+        same forest mask, same positions) reproduces the rollout logits, and
+        _grow_tree reruns on them with the recorded decisions. Same loss and
+        gradient as the grad rollout, without backpropagating through gamma-1
+        small forwards and their growing KV caches."""
+        B = drf_root.size(0)
+        gamma = self.gamma
+        ds, dc = self.tree_depth_starts, self.tree_depth_counts
+        rec = {}
+        if gamma == 1:
+            return self._grow_tree(drf_root, T, sample_tree, skip_full_logits, None, rec)
+        P = pre_allowed.size(1)
+        keys, values = tree_forest.pack_kv(drf_keys, drf_values, max_kv)
+        engine = self._graph_engine(P, B) if graph and drf_root.is_cuda else None
+        with torch.no_grad():
+            if engine is not None:
+                engine.load_prefix(keys, values)
+
+                def sample_step(d_step, tok_in):
+                    n_in = tok_in.size(1)
+                    allowed = self._forest_step_allowed(d_step, B, pre_allowed)
+                    pos = (a_t + d_step).repeat_interleave(n_in)
+                    out = engine.forward(tok_in.reshape(-1), pos, allowed[:, :P], allowed[:, P:])
+                    return out.float().view(B, n_in, -1)
+            else:
+                cache = tree_forest.pack_prefix(drf_keys, drf_values, max_kv, detach=True)
+
+                def sample_step(d_step, tok_in):
+                    n_in = tok_in.size(1)
+                    pos = (a_t + d_step).view(B, 1).expand(B, n_in)
+                    out = tree_forest.forward(
+                        self.draft_model, tok_in.reshape(1, -1), pos.reshape(1, -1),
+                        self._forest_step_allowed(d_step, B, pre_allowed), cache,
+                        use_cache=d_step < gamma - 1)
+                    return out.logits.float().view(B, n_in, -1)
+            sampled = self._grow_tree(drf_root.detach(), T, sample_tree, True, sample_step, rec)
+
+        # Replay: rows = depth blocks 0..gamma-2, each tree-major (the rollout's
+        # cache order); row block j sees forest columns of depths <= j only.
+        R = B * ds[gamma - 1]
+        allowed = torch.zeros(R, P + R, dtype=torch.bool, device=pre_allowed.device)
+        ids, pos = [], []
+        for j in range(gamma - 1):
+            blk = self._forest_step_allowed(j + 1, B, pre_allowed)
+            allowed[B * ds[j]:B * (ds[j] + dc[j]), :blk.size(1)] = blk
+            ids.append(sampled["tokens_per_depth"][j].reshape(-1))
+            pos.append((a_t + j + 1).repeat_interleave(dc[j]))
+        from transformers.cache_utils import DynamicCache
+        cache = DynamicCache()
+        for i, (k, v) in enumerate(zip(keys, values)):
+            cache.update(k, v, i)
+        logits = tree_forest.forward(
+            self.draft_model, torch.cat(ids).view(1, -1), torch.cat(pos).view(1, -1),
+            allowed, cache, use_cache=False).logits[0]
+
+        def replay_step(d_step, tok_in):
+            j = d_step - 1
+            return logits[B * ds[j]:B * (ds[j] + dc[j])].float().view(B, dc[j], -1)
+
+        return self._grow_tree(drf_root, T, sample_tree, skip_full_logits, replay_step, rec)
+
+    def _rollout_batch(self, batch_idx, anchor_pos,
+                       drf_anchor_logits, tgt_anchor_logits,
+                       drf_keys, drf_values, tgt_keys, tgt_values,
+                       temperature, eal_mode="budget", path_topk=16,
+                       eal_score_coef=0.1, anchor_group=None,
+                       anchor_kl_coef=0.0, path_eal_weights=None,
+                       path_eal_mean=False, path_eal_var_coef=0.0,
+                       tree_kl_w=None, tree_eal_w=None):
+        """Greedy top-k tree, global budget prune, batched across the microbatch.
+
+        Returns mean KL over kept nodes and mean Tree-EAL. KL carries the draft
+        gradient. Tree-EAL uses target acceptance probabilities.
+        """
+        device = drf_anchor_logits.device
+        B = len(batch_idx)
+        gamma = self.gamma
+        top_k = self.top_k_per_depth
+        depth_counts = self.tree_depth_counts
+        depth_starts = self.tree_depth_starts
+        kv_lens = [ap + 1 for ap in anchor_pos]
+        T = max(float(temperature), 1e-6)
+
+        a_t = torch.tensor(anchor_pos, device=device, dtype=torch.long)
+
+        # rollout: "grad" (default) runs the draft rollout with the gradient;
+        # "replay" / "graph" sample under no_grad (eager / CUDA graphs) and get
+        # the gradient from one replay forward over the sampled forest.
+        rollout = getattr(self, "rollout", "grad")
+        # forest: all trees in one sequence on a shared prefix KV (tree_forest.py).
+        # A single tree has nothing to share, so the grad rollout keeps the batch
+        # layout for it; the replay rollouts always use the forest.
+        forest = rollout != "grad" or (bool(getattr(self, "forest", False)) and B > 1)
+        if forest:
+            max_kv = max(kv_lens)
+            pre_allowed = tree_forest.prefix_allowed(
+                batch_idx, kv_lens, max_kv, drf_keys[0].size(0), device)
+            if rollout == "grad":
+                drf_cache = tree_forest.pack_prefix(drf_keys, drf_values, max_kv)
+        else:
+            drf_cache, max_kv = _pad_cache_batch(drf_keys, drf_values, batch_idx, kv_lens)
+
+        # Already the anchor rows, shape [B, V]. Casting the full prefix
+        # logits to float32 does not fit on an 80GB H100.
+        drf_root = drf_anchor_logits.float()
+        tgt_root = tgt_anchor_logits.float()
+        # sample_minpq: the draft SAMPLES k distinct children per node at T,
+        # matching eval --draft-mode sample. Otherwise greedy top-k.
+        sample_tree = eal_mode in ("sample_minpq", "sample_anyk", "sample_cover")
+        # soft_topk keeps the draft distribution so the accept length can train it.
+        skip_full_logits = eal_mode == "node_marginal"
+
+        def grad_step(d_step, tok_in):
+            nonlocal drf_cache
+            n_in = tok_in.size(1)
+            pos = (a_t + d_step).view(B, 1).expand(B, n_in)
+            if forest:
+                step_out = tree_forest.forward(
+                    self.draft_model, tok_in.reshape(1, -1), pos.reshape(1, -1),
+                    self._forest_step_allowed(d_step, B, pre_allowed),
+                    drf_cache, use_cache=(d_step < gamma - 1))
+            else:
+                mask = self._draft_step_mask_batch(
+                    d_step, kv_lens, max_kv, device, self.draft_model.dtype)
+                step_out = self.draft_model(
+                    input_ids=tok_in,
+                    attention_mask=mask,
+                    position_ids=pos,
+                    past_key_values=drf_cache,
+                    use_cache=(d_step < gamma - 1),
+                    return_dict=True,
+                )
             if d_step < gamma - 1:
                 drf_cache = step_out.past_key_values
+            return step_out.logits.float().view(B, n_in, -1)
+
+        if rollout == "grad":
+            grown = self._grow_tree(drf_root, T, sample_tree, skip_full_logits,
+                                    grad_step, {})
+        else:
+            grown = self._sample_then_replay(
+                drf_root, T, sample_tree, skip_full_logits, a_t, pre_allowed,
+                drf_keys, drf_values, max_kv, graph=rollout == "graph")
+        tokens_per_depth = grown["tokens_per_depth"]
+        pred_per_depth = grown["pred_per_depth"]
+        last_sel = grown["last_sel"]
+        full_leaf_tok, full_leaf_sc = grown["full_leaf_tok"], grown["full_leaf_sc"]
+        full_leaf_logp, full_leaf_pred = grown["full_leaf_logp"], grown["full_leaf_pred"]
+        prefix_logp = grown["prefix_logp"]
 
         tokens = torch.cat(tokens_per_depth, dim=1)
         drf_node = None if skip_full_logits else torch.cat(pred_per_depth, dim=1)

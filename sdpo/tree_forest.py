@@ -30,16 +30,24 @@ MIN_Q = 128
 _flex = None
 
 
-def pack_prefix(keys, values, max_kv):
-    """Per-layer [S, H, L, D] prefix KV → one sequence [1, H, S * max_kv, D]."""
-    from transformers.cache_utils import DynamicCache
-    cache = DynamicCache()
-    for i, (k, v) in enumerate(zip(keys, values)):
+def pack_kv(keys, values, max_kv):
+    """Per-layer [S, H, L, D] prefix KV → per-layer [1, H, S * max_kv, D]."""
+    pk, pv = [], []
+    for k, v in zip(keys, values):
         k, v = k[:, :, :max_kv], v[:, :, :max_kv]
         if k.size(0) > 1:
             k = k.transpose(0, 1).reshape(1, k.size(1), -1, k.size(3))
             v = v.transpose(0, 1).reshape(1, v.size(1), -1, v.size(3))
-        cache.update(k, v, i)
+        pk.append(k); pv.append(v)
+    return pk, pv
+
+
+def pack_prefix(keys, values, max_kv, detach=False):
+    """pack_kv as a DynamicCache the forest forwards append to."""
+    from transformers.cache_utils import DynamicCache
+    cache = DynamicCache()
+    for i, (k, v) in enumerate(zip(*pack_kv(keys, values, max_kv))):
+        cache.update(k.detach() if detach else k, v.detach() if detach else v, i)
     return cache
 
 
