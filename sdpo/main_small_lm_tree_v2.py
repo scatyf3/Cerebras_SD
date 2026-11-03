@@ -194,6 +194,12 @@ parser.add_argument('--eal_gradnorm_ratio', type=float, default=0.0,
                          'gradient (norms measured every --eal_gradnorm_every '
                          'micro-batches, EMA). 0 disables it.')
 parser.add_argument('--eal_gradnorm_every', type=int, default=10)
+parser.add_argument('--forest', action='store_true',
+                    help='Pack every tree of the microbatch into one sequence on a '
+                         'shared prefix KV (FlexAttention block mask) instead of one '
+                         'batch row per tree with its own copy of the prefix KV. Same '
+                         'loss; less memory and faster with many trees '
+                         '(--n_anchors / --n_draws / micro-batch > 1). See tree_forest.py.')
 parser.add_argument('--save_every_steps', type=int, default=1000,
                     help='Save a resumable mid-epoch checkpoint every N micro-batches '
                          'into savedir/mid. Only the newest one is kept, without the '
@@ -302,6 +308,7 @@ model.exact_burn = args.exact_burn
 model.exact_random_frac = args.exact_random_frac
 model.eal_gn_ratio = args.eal_gradnorm_ratio
 model.eal_gn_every = args.eal_gradnorm_every
+model.forest = args.forest
 
 args.deepspeed_config = None
 trainable_params = [p for p in model.parameters() if p.requires_grad]

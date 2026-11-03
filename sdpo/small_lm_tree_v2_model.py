@@ -39,6 +39,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 
+import tree_forest
+
 try:
     from transformers.cache_utils import DynamicCache
 except ImportError:
@@ -1093,15 +1095,22 @@ class SmallLMTreeV2Model(nn.Module):
         mask = torch.zeros(allowed.shape, device=device, dtype=dtype)
         return mask.masked_fill_(~allowed, torch.finfo(dtype).min).unsqueeze(1)
 
-    def _target_mask_batch(self, kv_lens, max_kv, parents, device, dtype):
-        """Per-sample ancestor mask for a budget-pruned tree. parents: [B, N]."""
+    def _tree_ancestors(self, parents):
+        """[B, N, N] bool, anc[b, i, j] = j is i or an ancestor of i. parents: [B, N]."""
         B, N = parents.shape
+        device = parents.device
         anc = torch.zeros(B, N, N, dtype=torch.bool, device=device)
         cur = torch.arange(N, device=device).view(1, N).expand(B, N)
         for _ in range(self.gamma):
             hit = F.one_hot(cur.clamp(min=0), N).bool() & (cur >= 0).unsqueeze(-1)
             anc |= hit
             cur = torch.where(cur >= 0, parents.gather(1, cur.clamp(min=0)), cur)
+        return anc
+
+    def _target_mask_batch(self, kv_lens, max_kv, parents, device, dtype):
+        """Per-sample ancestor mask for a budget-pruned tree. parents: [B, N]."""
+        B, N = parents.shape
+        anc = self._tree_ancestors(parents)
         prefix = _prefix_allowed(kv_lens, max_kv, device)
         allowed = torch.cat([prefix.unsqueeze(1).expand(B, N, max_kv), anc], dim=-1)
         mask = torch.zeros(allowed.shape, device=device, dtype=dtype)
@@ -1131,7 +1140,16 @@ class SmallLMTreeV2Model(nn.Module):
 
         a_t = torch.tensor(anchor_pos, device=device, dtype=torch.long)
 
-        drf_cache, max_kv = _pad_cache_batch(drf_keys, drf_values, batch_idx, kv_lens)
+        # forest: all trees in one sequence on a shared prefix KV (tree_forest.py).
+        # A single tree has nothing to share, so it keeps the batch layout.
+        forest = bool(getattr(self, "forest", False)) and B > 1
+        if forest:
+            max_kv = max(kv_lens)
+            drf_cache = tree_forest.pack_prefix(drf_keys, drf_values, max_kv)
+            pre_allowed = tree_forest.prefix_allowed(
+                batch_idx, kv_lens, max_kv, drf_keys[0].size(0), device)
+        else:
+            drf_cache, max_kv = _pad_cache_batch(drf_keys, drf_values, batch_idx, kv_lens)
 
         # Already the anchor rows, shape [B, V]. Casting the full prefix
         # logits to float32 does not fit on an 80GB H100.
@@ -1170,18 +1188,30 @@ class SmallLMTreeV2Model(nn.Module):
                 raise RuntimeError(
                     "budget prune before the last depth is not supported "
                     f"(depth {d_step - 1}: {n_in} != {depth_counts[d_step - 1]})")
-            mask = self._draft_step_mask_batch(
-                d_step, kv_lens, max_kv, device, self.draft_model.dtype)
             pos = (a_t + d_step).view(B, 1).expand(B, n_in)
-            step_out = self.draft_model(
-                input_ids=tokens_per_depth[-1],
-                attention_mask=mask,
-                position_ids=pos,
-                past_key_values=drf_cache,
-                use_cache=(d_step < gamma - 1),
-                return_dict=True,
-            )
-            depth_pred = step_out.logits.float()
+            if forest:
+                # Forest columns: one tree-major block per depth 0..d_step-1, the
+                # last being the nodes this step appends.
+                tree = self._draft_step_tree_allowed(d_step, device)
+                blocks = [tree_forest.block_diag(
+                    tree[:, depth_starts[j]:depth_starts[j] + depth_counts[j]]
+                    .unsqueeze(0).expand(B, -1, -1)) for j in range(d_step)]
+                step_out = tree_forest.forward(
+                    self.draft_model, tokens_per_depth[-1].reshape(1, -1),
+                    pos.reshape(1, -1), tree_forest.forest_allowed(pre_allowed, blocks, n_in),
+                    drf_cache, use_cache=(d_step < gamma - 1))
+            else:
+                mask = self._draft_step_mask_batch(
+                    d_step, kv_lens, max_kv, device, self.draft_model.dtype)
+                step_out = self.draft_model(
+                    input_ids=tokens_per_depth[-1],
+                    attention_mask=mask,
+                    position_ids=pos,
+                    past_key_values=drf_cache,
+                    use_cache=(d_step < gamma - 1),
+                    return_dict=True,
+                )
+            depth_pred = step_out.logits.float().view(B, n_in, -1)
             child_lp = F.log_softmax(depth_pred, dim=-1)
             k = top_k[d_step]
             if sample_tree:
@@ -1254,21 +1284,34 @@ class SmallLMTreeV2Model(nn.Module):
                 list(self.tree_depths[:n_prefix]) + [gamma - 1] * last_sel.size(1),
                 device=device, dtype=torch.long)
 
-        tgt_cache, max_kv_t = _pad_cache_batch(tgt_keys, tgt_values, batch_idx, kv_lens)
-        assert max_kv_t == max_kv
         pos = a_t.view(B, 1) + 1 + depths.view(1, -1)
-        tree_mask = self._target_mask_batch(
-            kv_lens, max_kv, parents, device, self.target_model.dtype)
-        with torch.no_grad():
-            tgt_out = self.target_model(
-                input_ids=tokens,
-                attention_mask=tree_mask,
-                position_ids=pos,
-                past_key_values=tgt_cache,
-                use_cache=False,
-                return_dict=True,
-            )
-        tgt_tree = tgt_out.logits.float()
+        if forest:
+            # Target logits are only read at parent rows, so the leaves (the last
+            # depth, the only one the budget prunes) are not forwarded.
+            n_fwd = depth_starts[-1] if gamma > 1 else N
+            tgt_cache = tree_forest.pack_prefix(tgt_keys, tgt_values, max_kv)
+            anc = self._tree_ancestors(parents)[:, :n_fwd, :n_fwd]
+            allowed = tree_forest.forest_allowed(
+                pre_allowed, [tree_forest.block_diag(anc)], n_fwd)
+            with torch.no_grad():
+                tgt_out = tree_forest.forward(
+                    self.target_model, tokens[:, :n_fwd].reshape(1, -1),
+                    pos[:, :n_fwd].reshape(1, -1), allowed, tgt_cache, use_cache=False)
+        else:
+            tgt_cache, max_kv_t = _pad_cache_batch(tgt_keys, tgt_values, batch_idx, kv_lens)
+            assert max_kv_t == max_kv
+            tree_mask = self._target_mask_batch(
+                kv_lens, max_kv, parents, device, self.target_model.dtype)
+            with torch.no_grad():
+                tgt_out = self.target_model(
+                    input_ids=tokens,
+                    attention_mask=tree_mask,
+                    position_ids=pos,
+                    past_key_values=tgt_cache,
+                    use_cache=False,
+                    return_dict=True,
+                )
+        tgt_tree = tgt_out.logits.float().view(B, -1, tgt_out.logits.size(-1))
         del tgt_out
         has_parent = parents >= 0
         gathered = tgt_tree.gather(
