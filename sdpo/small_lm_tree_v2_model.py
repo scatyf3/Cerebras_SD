@@ -1854,10 +1854,21 @@ class SmallLMTreeV2Model(nn.Module):
         }
 
     @torch.no_grad()
+    def _exact_batching(self):
+        """exact_batching: "continuous" fills every walk round of _exact_window_starts up
+        to a multiple of the chunk (fill=True), "per_round" expands only what the round
+        needs."""
+        mode = getattr(self, "exact_batching", "continuous")
+        assert mode in ("per_round", "continuous"), mode
+        return mode
+
     def _expansion_scope(self):
-        """With exact_fi, the tree expansions of _exact_window_starts calls inside the
-        block run on flashinfer (tree_expand_fi)."""
-        if not getattr(self, "exact_fi", False):
+        """exact_attn_backend: with "flashinfer" (default) the tree expansions of
+        _exact_window_starts calls inside the block run on flashinfer paged attention
+        (tree_expand_fi); "naive" keeps the per-start prefix copies and SDPA."""
+        backend = getattr(self, "exact_attn_backend", "flashinfer")
+        assert backend in ("naive", "flashinfer"), backend
+        if backend == "naive":
             return contextlib.nullcontext()
         import tree_expand_fi
         return tree_expand_fi.scope(self)
@@ -2200,7 +2211,7 @@ class SmallLMTreeV2Model(nn.Module):
                         loss_mask, path_topk,
                         chunk=int(getattr(self, "exact_starts_chunk", 64)),
                         all_positions=False,
-                        fill=bool(getattr(self, "exact_fill", False)))
+                        fill=self._exact_batching() == "continuous")
             else:
                 starts = decode_window_starts(
                     drf_hidden.detach(), tgt_hidden, self.draft_model.lm_head,
@@ -2259,7 +2270,7 @@ class SmallLMTreeV2Model(nn.Module):
                         segment_frac=float(getattr(self, "exact_segment_frac", 0.0)),
                         burn=int(getattr(self, "exact_burn", 32)),
                         random_frac=float(getattr(self, "exact_random_frac", 0.0)),
-                        fill=bool(getattr(self, "exact_fill", False)))
+                        fill=self._exact_batching() == "continuous")
                 exact_mask = self._exact_known
                 exact_stats = torch.stack([
                     exact.float().sum() / B,

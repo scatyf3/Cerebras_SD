@@ -24,8 +24,10 @@ ap.add_argument("--forest", action="store_true")
 ap.add_argument("--n_steps", type=int, default=6)
 ap.add_argument("--data", required=True, help="ShareGPT-format jsonl (e.g. gen_alpaca_regen.py output)")
 ap.add_argument("--chunk", type=int, default=64)
-ap.add_argument("--exact_fi", action="store_true", help="tree expansion on flashinfer (sdpo/tree_expand_fi.py)")
-ap.add_argument("--exact_fill", action="store_true", help="walk rounds filled up to a multiple of --chunk")
+ap.add_argument("--exact_attn_backend", choices=["naive", "flashinfer"], default="flashinfer",
+                help="tree expansion attention (flashinfer: sdpo/tree_expand_fi.py)")
+ap.add_argument("--exact_batching", choices=["per_round", "continuous"], default="continuous",
+                help="continuous: walk rounds filled up to a multiple of --chunk")
 ap.add_argument("--trace", action="store_true")
 ap.add_argument("--out", required=True)
 args = ap.parse_args()
@@ -43,8 +45,8 @@ m.exact_starts = True
 m.exact_starts_chunk = args.chunk
 m.top4_start_eal = True
 m.prob_starts = args.prob_starts
-m.exact_fi = args.exact_fi
-m.exact_fill = args.exact_fill
+m.exact_attn_backend = args.exact_attn_backend
+m.exact_batching = args.exact_batching
 m.exact_segment_frac = args.segment_frac
 m.exact_burn = 32
 m.exact_random_frac = args.random_frac
@@ -176,7 +178,7 @@ res = {"cfg": vars(args), "ms": ms, "tokens_per_step": toks / n,
        "per_step": {k: v / args.n_steps for k, v in CNT.items()}}
 print(f"== {args.out} prob_starts={args.prob_starts} seg={args.segment_frac} rnd={args.random_frac} "
       f"micro_bs={args.micro_bs} rollout={args.rollout} tokens/step={toks / n:.0f} "
-      f"peak={res['peak_GiB']:.1f}GiB fi={args.exact_fi} fill={args.exact_fill} chunk={args.chunk}")
+      f"peak={res['peak_GiB']:.1f}GiB attn={args.exact_attn_backend} batching={args.exact_batching} chunk={args.chunk}")
 print("  per step: " + "  ".join(f"{k}={v:.1f}" for k, v in sorted(res["per_step"].items()))
       + "  loss=" + ",".join(f"{x:.4f}" for x in LOSS))
 for k in ("tgt_prefix", "drf_prefix", "exact", "dense_loss", "rollout", "fwd_other",

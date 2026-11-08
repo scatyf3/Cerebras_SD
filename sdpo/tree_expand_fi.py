@@ -1,4 +1,4 @@
-"""FlashInfer tree expansion for SmallLMTreeV2Model._exact_window_starts (--exact_fi).
+"""FlashInfer tree expansion for SmallLMTreeV2Model._exact_window_starts (--exact_attn_backend flashinfer).
 
 The default expansion (_expand_chunks) gives every start of a chunk its own copy of its prefix
 KV, padded to the longest prefix of the chunk. Here the microbatch's draft prefix KV is laid out
