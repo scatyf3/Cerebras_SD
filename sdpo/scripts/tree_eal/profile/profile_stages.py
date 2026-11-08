@@ -24,6 +24,10 @@ ap.add_argument("--forest", action="store_true")
 ap.add_argument("--n_steps", type=int, default=6)
 ap.add_argument("--data", required=True, help="ShareGPT-format jsonl (e.g. gen_alpaca_regen.py output)")
 ap.add_argument("--chunk", type=int, default=64)
+ap.add_argument("--exact_attn_backend", choices=["naive", "flashinfer"], default="flashinfer",
+                help="tree expansion attention (flashinfer: sdpo/tree_expand_fi.py)")
+ap.add_argument("--exact_batching", choices=["per_round", "continuous"], default="continuous",
+                help="continuous: walk rounds filled up to a multiple of --chunk")
 ap.add_argument("--trace", action="store_true")
 ap.add_argument("--out", required=True)
 args = ap.parse_args()
@@ -41,6 +45,8 @@ m.exact_starts = True
 m.exact_starts_chunk = args.chunk
 m.top4_start_eal = True
 m.prob_starts = args.prob_starts
+m.exact_attn_backend = args.exact_attn_backend
+m.exact_batching = args.exact_batching
 m.exact_segment_frac = args.segment_frac
 m.exact_burn = 32
 m.exact_random_frac = args.random_frac
@@ -48,7 +54,7 @@ m.forest = args.forest
 m.rollout = args.rollout
 m.train()
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
-ds = build_dataset(tok, args.data, 2048, max_samples=args.n_steps * args.micro_bs)
+ds = build_dataset(tok, args.data, 2048, max_samples=args.n_steps * args.micro_bs * 2)
 
 T = defaultdict(float)
 st = {"on": False, "inner": 0, "hook_t": None}
@@ -91,6 +97,28 @@ m.draft_model.model.forward = dmf
 M.SmallLMTreeV2Model._exact_window_starts = wrap("exact", M.SmallLMTreeV2Model._exact_window_starts)
 M.SmallLMTreeV2Model._rollout_batch = wrap("rollout", M.SmallLMTreeV2Model._rollout_batch)
 M.dense_tree_loss = wrap("dense_loss", M.dense_tree_loss)
+CNT = defaultdict(float)
+_ep = M.SmallLMTreeV2Model._expand_positions
+_ews = M.SmallLMTreeV2Model._exact_window_starts
+
+
+def _ep_count(self, rows, *a, **k):
+    if st["on"]:
+        CNT["expand_calls"] += 1
+        CNT["expand_pos"] += len(rows)
+    return _ep(self, rows, *a, **k)
+
+
+def _ews_count(self, *a, **k):
+    out = _ews(self, *a, **k)
+    if st["on"]:
+        CNT["starts"] += float(out[0].sum())
+        CNT["al_sum_at_starts"] += float(out[1][out[0]].sum())
+    return out
+
+
+M.SmallLMTreeV2Model._expand_positions = _ep_count
+M.SmallLMTreeV2Model._exact_window_starts = _ews_count
 
 
 def batch(i):
@@ -105,6 +133,9 @@ def batch(i):
     return ids.cuda(), am.cuda(), lm.cuda(), int(am.sum())
 
 
+LOSS = []
+
+
 def step(i):
     torch.manual_seed(i)
     ids, am, lm, ntok = batch(i)
@@ -116,12 +147,15 @@ def step(i):
     loss.backward()
     t2 = sync()
     m.draft_model.zero_grad(set_to_none=True)
+    if st["on"]:
+        CNT["rounds"] += float(getattr(m, "_exact_rounds", 0) or 0)
+        LOSS.append(float(loss.detach()))
     return t0, t1, t2, ntok
 
 
 for p in range(2):                      # pass 0 warmup
     st["on"] = p == 1
-    T.clear()
+    T.clear(); CNT.clear(); LOSS.clear()
     torch.cuda.reset_peak_memory_stats()
     toks = 0
     for i in range(args.n_steps):
@@ -140,10 +174,13 @@ ms["fwd_other"] = ms["fwd"] - sum(ms.get(k, 0) for k in
 ms["step"] = ms["fwd"] + ms["bwd"]
 res = {"cfg": vars(args), "ms": ms, "tokens_per_step": toks / n,
        "peak_GiB": torch.cuda.max_memory_allocated() / 2**30,
-       "exact_rounds": getattr(m, "_exact_rounds", None)}
+       "exact_rounds": getattr(m, "_exact_rounds", None), "loss": LOSS,
+       "per_step": {k: v / args.n_steps for k, v in CNT.items()}}
 print(f"== {args.out} prob_starts={args.prob_starts} seg={args.segment_frac} rnd={args.random_frac} "
       f"micro_bs={args.micro_bs} rollout={args.rollout} tokens/step={toks / n:.0f} "
-      f"peak={res['peak_GiB']:.1f}GiB")
+      f"peak={res['peak_GiB']:.1f}GiB attn={args.exact_attn_backend} batching={args.exact_batching} chunk={args.chunk}")
+print("  per step: " + "  ".join(f"{k}={v:.1f}" for k, v in sorted(res["per_step"].items()))
+      + "  loss=" + ",".join(f"{x:.4f}" for x in LOSS))
 for k in ("tgt_prefix", "drf_prefix", "exact", "dense_loss", "rollout", "fwd_other",
           "bwd_head", "bwd_prefix", "step"):
     v = ms.get(k, 0.0)
