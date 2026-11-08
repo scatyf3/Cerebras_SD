@@ -165,6 +165,15 @@ parser.add_argument('--exact_starts', action='store_true',
                          'supervised position.')
 parser.add_argument('--exact_starts_chunk', type=int, default=64,
                     help='Positions expanded together by --exact_starts.')
+parser.add_argument('--exact_fi', action='store_true',
+                    help='--exact_starts: expand the draft trees with flashinfer paged '
+                         'attention on one shared prefix layout (sdpo/tree_expand_fi.py) '
+                         'instead of per-start padded prefix copies; peak memory stays '
+                         'flat in --exact_starts_chunk.')
+parser.add_argument('--exact_fill', action='store_true',
+                    help='--exact_starts walk: fill every expansion round up to a multiple '
+                         'of --exact_starts_chunk with the positions most likely to be on '
+                         'the walk, so far fewer rounds are needed. Same starts.')
 parser.add_argument('--top4_start_eal', action='store_true',
                     help='dense_tree + --exact_starts: E[L] at every window start is '
                          'the mean chain EAL of the path_topk paths the verification '
@@ -308,6 +317,8 @@ model.eal_start_split = args.eal_start_split
 model.top4path_starts = args.top4path_starts
 model.exact_starts = args.exact_starts
 model.exact_starts_chunk = args.exact_starts_chunk
+model.exact_fi = args.exact_fi
+model.exact_fill = args.exact_fill
 model.top4_start_eal = args.top4_start_eal
 model.prob_starts = args.prob_starts
 model.exact_segment_frac = args.exact_segment_frac
