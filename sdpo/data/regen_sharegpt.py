@@ -5,13 +5,34 @@ logic, but with argparse so the model, source dataset, and output path are
 configurable from a slurm wrapper instead of hardcoded.
 
 Output: JSONL where each line is {"id": str, "conversations": [{"from","value"}]}.
+
+Harmony models (gpt-oss): detected from the chat template. Generation keeps
+special tokens so the analysis and final channels can be split; each
+regenerated assistant turn is stored as
+  {"from": "gpt", "value": <final>, "thinking": <analysis>,
+   "raw": <exact completion text, special tokens included>, "finish": "stop"|"length"}
+Prompts longer than max_model_len - min_new_tokens are skipped (their turn is
+dropped) instead of failing the whole vLLM batch.
 """
 
 import argparse
 import gc
 import json
 import os
+import re
 from typing import Dict, List
+
+_HARMONY_MSG = re.compile(
+    r"<\|channel\|>(\w+)<\|message\|>(.*?)(?=<\|end\|>|<\|return\|>|<\|call\|>|<\|start\|>|$)",
+    re.S)
+
+
+def parse_harmony(text: str):
+    """Split a harmony completion into (thinking, final, has_final)."""
+    thinking, final = [], []
+    for channel, body in _HARMONY_MSG.findall(text):
+        (final if channel == "final" else thinking).append(body)
+    return "\n".join(thinking).strip(), "\n".join(final).strip(), bool(final)
 
 import torch
 from datasets import load_dataset
@@ -45,9 +66,13 @@ class ShareGPTProcessor:
         stop_token_ids: List[int],
         dtype: str,
         system_prompt: str,
+        reasoning_effort: str = "medium",
+        min_new_tokens: int = 256,
     ):
         self.model_path = model_path
         self.system_prompt = system_prompt
+        self.reasoning_effort = reasoning_effort
+        self.max_prompt_tokens = max_model_len - min_new_tokens
 
         # Load tokenizer for model-agnostic chat templating (Llama-2 / Llama-3
         # / Qwen all use different chat formats; tokenizer.apply_chat_template
@@ -55,6 +80,12 @@ class ShareGPTProcessor:
         # if tokenizer has no chat_template set.
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self._has_chat_template = bool(getattr(self.tokenizer, "chat_template", None))
+        self.harmony = "<|channel|>" in (self.tokenizer.chat_template or "")
+        print(f"harmony format: {self.harmony}  reasoning_effort: {reasoning_effort}")
+
+        if self.harmony and not stop_token_ids:
+            # <|return|> ends the final answer, <|call|> ends a tool call.
+            stop_token_ids = self.tokenizer.convert_tokens_to_ids(["<|return|>", "<|call|>"])
 
         # Auto-detect stop tokens from tokenizer if caller passed empty list.
         if not stop_token_ids:
@@ -82,6 +113,8 @@ class ShareGPTProcessor:
             top_p=top_p,
             max_tokens=max_tokens,
             stop_token_ids=stop_token_ids,
+            # Harmony needs the channel tokens to split analysis from final.
+            skip_special_tokens=not self.harmony,
         )
 
     def format_conversation(self, messages: List[Dict[str, str]]) -> str:
@@ -92,7 +125,12 @@ class ShareGPTProcessor:
         tokenizer has a chat_template (works for Llama-2 / Llama-3 / Qwen /
         etc.); falls back to hand-written Llama-3 tags otherwise.
         """
-        with_sys = [{"role": "system", "content": self.system_prompt}] + messages
+        with_sys = ([{"role": "system", "content": self.system_prompt}]
+                    if self.system_prompt else []) + messages
+        if self.harmony:
+            return self.tokenizer.apply_chat_template(
+                with_sys, tokenize=False, add_generation_prompt=True,
+                reasoning_effort=self.reasoning_effort)
         if self._has_chat_template:
             try:
                 return self.tokenizer.apply_chat_template(
@@ -116,7 +154,7 @@ class ShareGPTProcessor:
 
     def prepare_prompts_batch(self, batch: List[Dict]):
         prompts, meta = [], []
-        n_skipped = 0
+        n_skipped = n_long = 0
         for item_idx, item in enumerate(batch):
             history = []
             conv = item["conversations"]
@@ -133,6 +171,12 @@ class ShareGPTProcessor:
                     except Exception:
                         n_skipped += 1
                     else:
+                        n_tok = len(self.tokenizer(rendered, add_special_tokens=False).input_ids)
+                        if n_tok > self.max_prompt_tokens:
+                            # One over-long prompt makes vLLM reject the whole
+                            # batch; later turns only get longer, so stop here.
+                            n_long += 1
+                            break
                         prompts.append(rendered)
                         meta.append({"item_idx": item_idx, "turn_idx": turn_idx})
                     history.append({"role": "user", "content": turn["value"]})
@@ -144,24 +188,40 @@ class ShareGPTProcessor:
                                         "content": conv[turn_idx + 1]["value"]})
         if n_skipped > 0:
             print(f"  prepare_prompts_batch: skipped {n_skipped} prompts due to chat-template error")
+        if n_long > 0:
+            print(f"  prepare_prompts_batch: cut {n_long} conversations at a prompt "
+                  f"over {self.max_prompt_tokens} tokens")
         return prompts, meta
+
+    def _make_turn(self, completion) -> Dict:
+        if not self.harmony:
+            return {"from": "gpt", "value": completion.text.strip()}
+        thinking, final, _ = parse_harmony(completion.text)
+        return {"from": "gpt", "value": final, "thinking": thinking,
+                "raw": completion.text, "finish": completion.finish_reason}
 
     def process_batch(self, batch: List[Dict]) -> List[Dict]:
         prompts, meta = self.prepare_prompts_batch(batch)
         if not prompts:
-            return batch
+            return []
         outputs = self.llm.generate(prompts, self.sampling_params)
-        response_map = {(m["item_idx"], m["turn_idx"]): o.outputs[0].text.strip()
+        response_map = {(m["item_idx"], m["turn_idx"]): self._make_turn(o.outputs[0])
                         for o, m in zip(outputs, meta)}
         out = []
         for item_idx, item in enumerate(batch):
             new_conv = []
             for turn_idx, turn in enumerate(item["conversations"]):
                 if turn["from"] in ("user", "human"):
-                    new_conv.append(turn)
                     key = (item_idx, turn_idx)
-                    if key in response_map:
-                        new_conv.append({"from": "gpt", "value": response_map[key]})
+                    if key not in response_map:
+                        # Cut at the first turn without a regenerated answer so
+                        # no original (non-target) response or dangling user
+                        # turn ends up in the training data.
+                        break
+                    new_conv.append(turn)
+                    new_conv.append(response_map[key])
+            if not new_conv:
+                continue
             out.append({
                 "id": item.get("id", f"conversation_{item_idx}"),
                 "conversations": new_conv,
@@ -209,10 +269,9 @@ class ShareGPTProcessor:
                 try:
                     regenerated.extend(self.process_batch(batch))
                 except Exception as e:
-                    print(f"\nbatch error: {e!r}; passing through original turns")
-                    for it in batch:
-                        regenerated.append({"id": it.get("id", f"err_{i}"),
-                                            "conversations": it["conversations"]})
+                    # Dropping beats passing the original ShareGPT answers
+                    # through: those are not the target's distribution.
+                    print(f"\nbatch error: {e!r}; dropping {len(batch)} conversations")
                 pbar.update(len(batch))
 
                 if checkpoint_every and len(regenerated) - written >= checkpoint_every:
@@ -257,7 +316,12 @@ def main():
     p.add_argument("--batch-size", type=int, default=200)
     p.add_argument("--max-samples", type=int, default=0, help="0 = full dataset")
     p.add_argument("--checkpoint-every", type=int, default=10000)
-    p.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
+    p.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT,
+                   help="'' = no system message (harmony then keeps only its built-in one)")
+    p.add_argument("--reasoning-effort", default="medium", choices=["low", "medium", "high"],
+                   help="harmony models only")
+    p.add_argument("--min-new-tokens", type=int, default=256,
+                   help="skip prompts longer than max_model_len - this")
     args = p.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
@@ -284,6 +348,8 @@ def main():
         stop_token_ids=args.stop_token_ids,
         dtype=args.dtype,
         system_prompt=args.system_prompt,
+        reasoning_effort=args.reasoning_effort,
+        min_new_tokens=args.min_new_tokens,
     )
     proc.process_dataset(
         data_path=args.data,

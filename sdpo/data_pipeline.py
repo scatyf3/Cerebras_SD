@@ -37,10 +37,99 @@ SEP_TOKENS = {
 
 
 def detect_model_family(tokenizer):
+    if "<|channel|>" in (getattr(tokenizer, "chat_template", None) or ""):
+        return 'harmony'
     name = getattr(tokenizer, 'name_or_path', '').lower()
     if 'qwen' in name:
         return 'qwen'
     return 'llama'
+
+
+def harmony_messages(src):
+    """ShareGPT turns (from sdpo/data/regen_sharegpt.py) -> chat messages.
+
+    Assistant turns carry "thinking" (analysis channel). A turn cut off by
+    max_tokens (finish == "length") ends the conversation there, with the user
+    turn that asked for it.
+    """
+    roles = {"human": "user", "gpt": "assistant", "user": "user", "assistant": "assistant"}
+    msgs = []
+    for sent in src:
+        role = roles[sent["from"]]
+        if role == "assistant":
+            if sent.get("finish") == "length":
+                if msgs and msgs[-1]["role"] == "user":
+                    msgs.pop()
+                break
+            m = {"role": "assistant", "content": sent["value"]}
+            if sent.get("thinking"):
+                m["thinking"] = sent["thinking"]
+            msgs.append(m)
+        else:
+            msgs.append({"role": "user", "content": sent["value"]})
+    while msgs and msgs[-1]["role"] != "assistant":
+        msgs.pop()
+    return msgs
+
+
+def harmony_loss_mask(ids, tokenizer):
+    """1 on every token the model generates in an assistant turn.
+
+    Generation starts after "<|start|>assistant" and runs through the
+    terminating <|end|> / <|return|> / <|call|>. When an analysis message is
+    followed directly by the final message, the model also generates the
+    second "<|start|>assistant" header, so that header is included too.
+    The chat template keeps the analysis only for the last assistant turn.
+    """
+    tid = tokenizer.convert_tokens_to_ids
+    start = tid("<|start|>")
+    ends = {tid("<|end|>"), tid("<|return|>"), tid("<|call|>")}
+    asst = tokenizer.encode("assistant", add_special_tokens=False)
+    n, h = len(ids), len(asst)
+    mask = [0] * n
+    i = 0
+    while i < n:
+        if ids[i] == start and ids[i + 1:i + 1 + h] == asst:
+            j = i + 1 + h
+            if i > 0 and mask[i - 1] == 1:
+                for t in range(i, j):
+                    mask[t] = 1
+            k = j
+            while k < n and ids[k] not in ends:
+                k += 1
+            for t in range(j, min(k + 1, n)):
+                mask[t] = 1
+            i = k + 1
+        else:
+            i += 1
+    return mask
+
+
+def _build_harmony(ds, tokenizer, max_len, max_samples, gamma):
+    def preprocess(examples):
+        out = {"attention_mask": [], "input_ids": [], "loss_mask": []}
+        for i in range(len(examples['id'])):
+            msgs = harmony_messages(examples['conversations'][i] or [])
+            if not msgs:
+                continue
+            conversation = tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=False)
+            ids = tokenizer(conversation, add_special_tokens=False).input_ids
+            if len(ids) > max_len:
+                if max_samples is not None:
+                    ids = ids[:max_len]
+                else:
+                    continue
+            loss_mask = harmony_loss_mask(ids, tokenizer)
+            L = len(ids)
+            if L <= gamma or sum(loss_mask[1:L - gamma + 1]) == 0:
+                continue
+            out["input_ids"].append(ids)
+            out["loss_mask"].append(loss_mask)
+            out["attention_mask"].append([1] * L)
+        return out
+
+    return ds.map(preprocess, batched=True, num_proc=1, remove_columns=ds.column_names)
 
 
 def build_dataset(tokenizer, datapath, max_len, max_samples=None, gamma=7):
@@ -50,6 +139,8 @@ def build_dataset(tokenizer, datapath, max_len, max_samples=None, gamma=7):
         ds = ds.select(range(min(max_samples, len(ds))))
 
     family = detect_model_family(tokenizer)
+    if family == 'harmony':
+        return _build_harmony(ds, tokenizer, max_len, max_samples, gamma)
     sep_cfg = SEP_TOKENS[family]
     SEP_ASST = sep_cfg["sep_asst"]
     SEP_USER = sep_cfg["sep_user"]
@@ -57,7 +148,8 @@ def build_dataset(tokenizer, datapath, max_len, max_samples=None, gamma=7):
 
     def preprocess(examples):
         out = {"attention_mask": [], "input_ids": [], "loss_mask": []}
-        roles = {"human": "user", "gpt": "assistant"}
+        roles = {"human": "user", "gpt": "assistant",
+                 "user": "user", "assistant": "assistant"}
 
         for i in range(len(examples['id'])):
             src = examples['conversations'][i]
