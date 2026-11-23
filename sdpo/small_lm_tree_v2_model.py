@@ -1287,6 +1287,17 @@ class SmallLMTreeV2Model(nn.Module):
     def __init__(self, target_path, draft_path, top_k_per_depth,
                  dtype=torch.float16, tree_budget=None):
         super().__init__()
+        self._init_tree(top_k_per_depth, tree_budget)
+
+        self.target_model = AutoModelForCausalLM.from_pretrained(
+            target_path, torch_dtype=dtype, attn_implementation="sdpa")
+        self.draft_model = AutoModelForCausalLM.from_pretrained(
+            draft_path, torch_dtype=dtype, attn_implementation="sdpa")
+        for p in self.target_model.parameters():
+            p.requires_grad = False
+        self.target_model.eval()
+
+    def _init_tree(self, top_k_per_depth, tree_budget):
         self.top_k_per_depth = tuple(int(x) for x in top_k_per_depth)
         self.gamma = len(self.top_k_per_depth)
         assert self.gamma >= 1
@@ -1301,15 +1312,6 @@ class SmallLMTreeV2Model(nn.Module):
         self.tree_budget = int(N if tree_budget is None else tree_budget)
         if self.tree_budget < 1:
             raise ValueError(f"tree_budget must be >= 1, got {self.tree_budget}")
-
-        self.target_model = AutoModelForCausalLM.from_pretrained(
-            target_path, torch_dtype=dtype, attn_implementation="sdpa")
-        self.draft_model = AutoModelForCausalLM.from_pretrained(
-            draft_path, torch_dtype=dtype, attn_implementation="sdpa")
-        for p in self.target_model.parameters():
-            p.requires_grad = False
-        self.target_model.eval()
-
         self.register_buffer(
             "paths", torch.tensor(paths, dtype=torch.long), persistent=False)
 
@@ -1408,6 +1410,96 @@ class SmallLMTreeV2Model(nn.Module):
         mask = torch.zeros(allowed.shape, device=device, dtype=dtype)
         return mask.masked_fill_(~allowed, torch.finfo(dtype).min).unsqueeze(1)
 
+    # ---- Model hooks. Eagle3TreeModel (sdpo/eagle3_tree_model.py) overrides
+    # these; everything else (rollout, verify, losses) is shared. Token ids and
+    # logits returned here are in the "loss vocabulary" the losses index.
+
+    def _target_prefix(self, input_ids, attention_mask):
+        """Frozen target over the sequence -> (hidden, keys, values)."""
+        out = self.target_model.model(input_ids=input_ids, attention_mask=attention_mask,
+                                      use_cache=True, return_dict=True)
+        keys, values = _extract_kv_lists(out.past_key_values)
+        return out.last_hidden_state, keys, values
+
+    def _draft_prefix(self, input_ids, attention_mask):
+        """Draft over the sequence (with grad) -> (hidden, keys, values)."""
+        out = self.draft_model.model(input_ids=input_ids, attention_mask=attention_mask,
+                                     use_cache=True, return_dict=True)
+        keys, values = _extract_kv_lists(out.past_key_values)
+        return out.last_hidden_state, keys, values
+
+    @staticmethod
+    def _anchor_rows(hidden, batch_idx, anchor_pos):
+        b_t = torch.tensor(batch_idx, device=hidden.device, dtype=torch.long)
+        a_t = torch.tensor(anchor_pos, device=hidden.device, dtype=torch.long)
+        return hidden[b_t, a_t]
+
+    def _target_anchor_logits(self, hidden, batch_idx, anchor_pos):
+        """[B_tree, V] target logits for the token after each anchor."""
+        return self.target_model.lm_head(self._anchor_rows(hidden, batch_idx, anchor_pos)).float()
+
+    def _draft_anchor_logits(self, hidden, batch_idx, anchor_pos):
+        """[B_tree, V] draft logits for the token after each anchor (tree roots)."""
+        return self.draft_model.lm_head(self._anchor_rows(hidden, batch_idx, anchor_pos)).float()
+
+    def _draft_tree_begin(self, batch_idx, anchor_pos, drf_keys, drf_values):
+        """State for _draft_tree_step: the draft prefix cache cut at each anchor."""
+        kv_lens = [ap + 1 for ap in anchor_pos]
+        cache, max_kv = _pad_cache_batch(drf_keys, drf_values, batch_idx, kv_lens)
+        a_t = torch.tensor(anchor_pos, device=drf_keys[0].device, dtype=torch.long)
+        return {"cache": cache, "kv_lens": kv_lens, "max_kv": max_kv, "a_t": a_t}
+
+    def _draft_tree_step(self, state, d_step, tokens, use_cache):
+        """Feed the depth-(d_step-1) nodes `tokens` [B, n_in]; returns their
+        child logits [B, n_in, V]. Nodes are parent-major (children of node j
+        are contiguous), as _rollout_batch lays them out."""
+        B, n_in = tokens.shape
+        mask = self._draft_step_mask_batch(
+            d_step, state["kv_lens"], state["max_kv"], tokens.device, self.draft_model.dtype)
+        pos = (state["a_t"] + d_step).view(B, 1).expand(B, n_in)
+        step_out = self.draft_model(
+            input_ids=tokens,
+            attention_mask=mask,
+            position_ids=pos,
+            past_key_values=state["cache"],
+            use_cache=use_cache,
+            return_dict=True,
+        )
+        if use_cache:
+            state["cache"] = step_out.past_key_values
+        return step_out.logits.float()
+
+    def _target_tree_logits(self, tokens, parents, depths, batch_idx, anchor_pos,
+                            tgt_keys, tgt_values):
+        """Frozen target verify of the tree: [B, N] tokens, parents [B, N],
+        depths [B, N] or [N] -> logits [B, N, V] at each node (float)."""
+        B = tokens.size(0)
+        device = tokens.device
+        kv_lens = [ap + 1 for ap in anchor_pos]
+        a_t = torch.tensor(anchor_pos, device=device, dtype=torch.long)
+        tgt_cache, max_kv = _pad_cache_batch(tgt_keys, tgt_values, batch_idx, kv_lens)
+        if depths.dim() == 1:
+            depths = depths.view(1, -1)
+        pos = a_t.view(B, 1) + 1 + depths
+        tree_mask = self._target_mask_batch(
+            kv_lens, max_kv, parents, device, self.target_model.dtype)
+        with torch.no_grad():
+            tgt_out = self.target_model(
+                input_ids=tokens,
+                attention_mask=tree_mask,
+                position_ids=pos,
+                past_key_values=tgt_cache,
+                use_cache=False,
+                return_dict=True,
+            )
+        return tgt_out.logits.float()
+
+    @staticmethod
+    def _node_kl(tgt_node, drf_node):
+        """[B, N] KL(p_target || q_draft) per node at temperature 1."""
+        tgt_logp = F.log_softmax(tgt_node, dim=-1)
+        return (tgt_logp.exp() * (tgt_logp - F.log_softmax(drf_node, dim=-1))).sum(-1).clamp(min=0.0)
+
     def _rollout_batch(self, batch_idx, anchor_pos,
                        drf_anchor_logits, tgt_anchor_logits,
                        drf_keys, drf_values, tgt_keys, tgt_values,
@@ -1427,12 +1519,9 @@ class SmallLMTreeV2Model(nn.Module):
         top_k = self.top_k_per_depth
         depth_counts = self.tree_depth_counts
         depth_starts = self.tree_depth_starts
-        kv_lens = [ap + 1 for ap in anchor_pos]
         T = max(float(temperature), 1e-6)
 
-        a_t = torch.tensor(anchor_pos, device=device, dtype=torch.long)
-
-        drf_cache, max_kv = _pad_cache_batch(drf_keys, drf_values, batch_idx, kv_lens)
+        drf_state = self._draft_tree_begin(batch_idx, anchor_pos, drf_keys, drf_values)
 
         # Already the anchor rows, shape [B, V]. Casting the full prefix
         # logits to float32 does not fit on an 80GB H100.
@@ -1473,18 +1562,8 @@ class SmallLMTreeV2Model(nn.Module):
                 raise RuntimeError(
                     "budget prune before the last depth is not supported "
                     f"(depth {d_step - 1}: {n_in} != {depth_counts[d_step - 1]})")
-            mask = self._draft_step_mask_batch(
-                d_step, kv_lens, max_kv, device, self.draft_model.dtype)
-            pos = (a_t + d_step).view(B, 1).expand(B, n_in)
-            step_out = self.draft_model(
-                input_ids=tokens_per_depth[-1],
-                attention_mask=mask,
-                position_ids=pos,
-                past_key_values=drf_cache,
-                use_cache=(d_step < gamma - 1),
-                return_dict=True,
-            )
-            depth_pred = step_out.logits.float()
+            depth_pred = self._draft_tree_step(
+                drf_state, d_step, tokens_per_depth[-1], use_cache=(d_step < gamma - 1))
             child_lp = F.log_softmax(depth_pred, dim=-1)
             k = top_k[d_step]
             if sample_tree:
@@ -1531,8 +1610,6 @@ class SmallLMTreeV2Model(nn.Module):
                     flat_pred = flat_pred.gather(
                         1, sel.unsqueeze(-1).expand(B, keep, flat_pred.size(-1)))
                 pred_per_depth.append(flat_pred)
-            if d_step < gamma - 1:
-                drf_cache = step_out.past_key_values
 
         tokens = torch.cat(tokens_per_depth, dim=1)
         drf_node = None if skip_full_logits else torch.cat(pred_per_depth, dim=1)
@@ -1632,23 +1709,9 @@ class SmallLMTreeV2Model(nn.Module):
                         tgt_node[b, j] = live_to_dense[live_n]
                 self._srsd_cache_skipped = float(B)
             else:
-                tgt_cache, max_kv_t = _pad_cache_batch(
-                    tgt_keys, tgt_values, batch_idx, kv_lens)
-                assert max_kv_t == max_kv
-                pos_u = a_t.view(B, 1) + 1 + depths_u
-                tree_mask_u = self._target_mask_batch(
-                    kv_lens, max_kv, union_parents, device, self.target_model.dtype)
-                with torch.no_grad():
-                    tgt_out = self.target_model(
-                        input_ids=tok_u,
-                        attention_mask=tree_mask_u,
-                        position_ids=pos_u,
-                        past_key_values=tgt_cache,
-                        use_cache=False,
-                        return_dict=True,
-                    )
-                tgt_tree_u = tgt_out.logits.float()
-                del tgt_out
+                tgt_tree_u = self._target_tree_logits(
+                    tok_u, union_parents, depths_u, batch_idx, anchor_pos,
+                    tgt_keys, tgt_values)
                 has_par_u = union_parents >= 0
                 gathered_u = tgt_tree_u.gather(
                     1, union_parents.clamp(min=0).unsqueeze(-1).expand(
@@ -1693,23 +1756,8 @@ class SmallLMTreeV2Model(nn.Module):
             node_mask = valid_u
             tgt_tree = None
         else:
-            tgt_cache, max_kv_t = _pad_cache_batch(
-                tgt_keys, tgt_values, batch_idx, kv_lens)
-            assert max_kv_t == max_kv
-            pos = a_t.view(B, 1) + 1 + depths.view(1, -1)
-            tree_mask = self._target_mask_batch(
-                kv_lens, max_kv, parents, device, self.target_model.dtype)
-            with torch.no_grad():
-                tgt_out = self.target_model(
-                    input_ids=tokens,
-                    attention_mask=tree_mask,
-                    position_ids=pos,
-                    past_key_values=tgt_cache,
-                    use_cache=False,
-                    return_dict=True,
-                )
-            tgt_tree = tgt_out.logits.float()
-            del tgt_out
+            tgt_tree = self._target_tree_logits(
+                tokens, parents, depths, batch_idx, anchor_pos, tgt_keys, tgt_values)
             has_parent = parents >= 0
             gathered = tgt_tree.gather(
                 1, parents.clamp(min=0).unsqueeze(-1).expand(
@@ -1729,16 +1777,10 @@ class SmallLMTreeV2Model(nn.Module):
             n_sib = torch.zeros(B, N + 1, device=device).scatter_add_(
                 1, slot, node_mask.float())
             w_kl = node_mask.float() / n_sib.gather(1, slot).clamp(min=1.0)
-            tgt_logp = F.log_softmax(tgt_node, dim=-1)
-            kl_node = (tgt_logp.exp() * (
-                tgt_logp - F.log_softmax(drf_node, dim=-1))).sum(-1).clamp(min=0.0)
+            kl_node = self._node_kl(tgt_node, drf_node)
             kl = (kl_node * w_kl).sum() / w_kl.sum().clamp(min=1.0)
-            del tgt_logp
         else:
-            tgt_logp = F.log_softmax(tgt_node, dim=-1)
-            tgt_p = tgt_logp.exp()
-            drf_logp = F.log_softmax(drf_node, dim=-1)
-            kl = (tgt_p * (tgt_logp - drf_logp)).sum(-1).clamp(min=0.0).mean()
+            kl = self._node_kl(tgt_node, drf_node).mean()
         if eal_mode == "dense_tree":
             # KL over the nodes of the path_topk paths eval keeps (ranked by
             # the product of draft node probabilities); E[L] is trained densely
@@ -1751,10 +1793,7 @@ class SmallLMTreeV2Model(nn.Module):
             chosen = self.paths[full_leaf_sc.detach().topk(k_paths, dim=-1).indices]
             on_path = torch.zeros(B, N, device=device, dtype=torch.bool)
             on_path.scatter_(1, chosen.reshape(B, -1), True)
-            tgt_logp = F.log_softmax(tgt_node, dim=-1)
-            kl_node = (tgt_logp.exp() * (tgt_logp - F.log_softmax(drf_node, dim=-1))
-                       ).sum(-1).clamp(min=0.0)
-            del tgt_logp
+            kl_node = self._node_kl(tgt_node, drf_node)
             kl = (kl_node * on_path).sum() / on_path.sum().clamp(min=1)
             with torch.no_grad():
                 accept = tgt_node.argmax(dim=-1).eq(tokens) & on_path
@@ -1782,10 +1821,7 @@ class SmallLMTreeV2Model(nn.Module):
             w_kl = on_path.float() / n_sib.gather(1, slot).clamp(min=1.0)
             if tree_kl_w is not None:
                 w_kl = w_kl * tree_kl_w.unsqueeze(-1)
-            tgt_logp = F.log_softmax(tgt_node, dim=-1)
-            kl_node = (tgt_logp.exp() * (tgt_logp - F.log_softmax(drf_node, dim=-1))
-                       ).sum(-1).clamp(min=0.0)
-            del tgt_logp
+            kl_node = self._node_kl(tgt_node, drf_node)
             kl = (kl_node * w_kl).sum() / w_kl.sum().clamp(min=1.0)
             q_u = torch.softmax(drf_node / T, dim=-1).gather(
                 -1, tgt_node.argmax(dim=-1, keepdim=True)).squeeze(-1)
@@ -2106,12 +2142,9 @@ class SmallLMTreeV2Model(nn.Module):
                             1, slot.clamp(min=0), valid.float())
                     w_kl = valid.float() / n_sib.gather(
                         1, slot.clamp(min=0)).clamp(min=1.0)
-                    tgt_logp = F.log_softmax(tgt_u, dim=-1)
-                    kl_node = (tgt_logp.exp() * (
-                        tgt_logp - F.log_softmax(drf_u, dim=-1))
-                        ).sum(-1).clamp(min=0.0)
+                    kl_node = self._node_kl(tgt_u, drf_u)
                     kl = (kl_node * w_kl).sum() / w_kl.sum().clamp(min=1.0)
-                    del tgt_logp, drf_u, tgt_u
+                    del drf_u, tgt_u
             else:
                 eal = tree_expected_accepted_length(alpha_u, union_parents).mean()
                 eal_loss = None
@@ -2819,17 +2852,6 @@ class SmallLMTreeV2Model(nn.Module):
 
         # Only the anchor rows need logits, so the LM head runs on those rows
         # instead of materializing [B, L, V].
-        def _prefix(lm):
-            out = lm.model(input_ids=input_ids, attention_mask=attention_mask,
-                           use_cache=True, return_dict=True)
-            keys, values = _extract_kv_lists(out.past_key_values)
-            return out.last_hidden_state, keys, values
-
-        def _rows(lm, hidden):
-            b_t = torch.tensor(batch_idx, device=hidden.device, dtype=torch.long)
-            a_t = torch.tensor(anchor_pos, device=hidden.device, dtype=torch.long)
-            return lm.lm_head(hidden[b_t, a_t]).float()
-
         start_anchors = (eal_mode == "top4_kl_eal"
                          and bool(getattr(self, "dense_eal_start", False)))
         top4_dense_kl = (eal_mode == "top4_kl_eal"
@@ -2838,13 +2860,14 @@ class SmallLMTreeV2Model(nn.Module):
         split = start_anchors and bool(getattr(self, "eal_start_split", False))
         tree_kl_w = tree_eal_w = None
         with torch.no_grad():
-            tgt_hidden, tgt_keys, tgt_values = _prefix(self.target_model)
+            tgt_hidden, tgt_keys, tgt_values = self._target_prefix(input_ids, attention_mask)
             if not start_anchors:
-                tgt_anchor = _rows(self.target_model, tgt_hidden) if batch_idx else None
+                tgt_anchor = (self._target_anchor_logits(tgt_hidden, batch_idx, anchor_pos)
+                              if batch_idx else None)
             if not keep_tgt:
                 del tgt_hidden
 
-        drf_hidden, drf_keys, drf_values = _prefix(self.draft_model)
+        drf_hidden, drf_keys, drf_values = self._draft_prefix(input_ids, attention_mask)
 
         if start_anchors:
             # Anchors only where greedy tree decoding opens a window.
@@ -2886,7 +2909,8 @@ class SmallLMTreeV2Model(nn.Module):
                 is_start[n_uniform:] = 1.0
                 tree_kl_w, tree_eal_w = 1.0 - is_start, is_start
             with torch.no_grad():
-                tgt_anchor = _rows(self.target_model, tgt_hidden) if batch_idx else None
+                tgt_anchor = (self._target_anchor_logits(tgt_hidden, batch_idx, anchor_pos)
+                              if batch_idx else None)
             if not top4_dense_kl:
                 del tgt_hidden
 
@@ -2901,7 +2925,7 @@ class SmallLMTreeV2Model(nn.Module):
             }
 
         dense_loss = None
-        drf_anchor = _rows(self.draft_model, drf_hidden)
+        drf_anchor = self._draft_anchor_logits(drf_hidden, batch_idx, anchor_pos)
         if eal_mode == "dense_tree":
             exact = None
             if getattr(self, "exact_starts", False):

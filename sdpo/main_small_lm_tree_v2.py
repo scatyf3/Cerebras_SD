@@ -68,7 +68,8 @@ parser.add_argument('--eal_mode', type=str, default='budget',
                              'sample_minpq', 'sample_rsd', 'sample_rsd_offline',
                              'sample_anyk',
                              'sample_cover', 'wsoft',
-                             'greedy_topk', 'dense_tree', 'top4_kl_eal'],
+                             'greedy_topk', 'dense_tree', 'top4_kl_eal',
+                             'eagle3_ttt'],
                     help='budget: KL minus E[L] on the node-budget tree. '
                          'path_topk: KL minus exact E[L] on the Top-K path union. '
                          'node_marginal: old node-weighted NLL, not used. '
@@ -274,6 +275,17 @@ parser.add_argument('--save_every_steps', type=int, default=1000,
 parser.add_argument('--snapshot_frac', type=float, default=0.0,
                     help='Also save the draft as savedir/hf_e{epoch}_p{percent} every '
                          'this fraction of an epoch (kept, for training-curve evals).')
+parser.add_argument('--draft_type', choices=['lm', 'eagle3'], default='lm',
+                    help='lm: --draftpath is a small HF causal LM sharing the tokenizer. '
+                         'eagle3: --draftpath is an EAGLE-3 head dir (config.json + weights, '
+                         'see sdpo/scripts/eagle3/init_eagle3_draft.py); supports the '
+                         'tree modes in eagle3_tree_model.EAGLE3_MODES plus eagle3_ttt '
+                         '(plain EAGLE-3 training).')
+parser.add_argument('--eagle_aux_layers', type=str, default='',
+                    help='eagle3: target hidden_states indices fed to fc '
+                         '(default 2,N//2,N-3).')
+parser.add_argument('--ttt_length', type=int, default=7,
+                    help='eagle3_ttt: number of training-time-test steps.')
 parser.add_argument('--local_rank', type=int, default=-1)
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
@@ -468,13 +480,28 @@ if args.seed > 0:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-model = SmallLMTreeV2Model(
-    target_path=args.basepath,
-    draft_path=args.draftpath,
-    top_k_per_depth=top_k_list,
-    dtype=model_dtype,
-    tree_budget=(args.tree_budget if args.tree_budget > 0 else None),
-)
+if args.draft_type == 'eagle3':
+    from eagle3_tree_model import Eagle3TreeModel
+    model = Eagle3TreeModel(
+        target_path=args.basepath,
+        draft_path=args.draftpath,
+        top_k_per_depth=top_k_list,
+        dtype=model_dtype,
+        tree_budget=(args.tree_budget if args.tree_budget > 0 else None),
+        aux_layers=[int(x) for x in args.eagle_aux_layers.split(',') if x.strip()] or None,
+        ttt_length=args.ttt_length,
+    )
+    print(f"[SmallLMTreeV2] EAGLE-3 draft {args.draftpath} aux_layers={model.aux_layers} "
+          f"draft_vocab={model.draft_model.lm_head.out_features} "
+          f"sliding_window={model.sliding_window}")
+else:
+    model = SmallLMTreeV2Model(
+        target_path=args.basepath,
+        draft_path=args.draftpath,
+        top_k_per_depth=top_k_list,
+        dtype=model_dtype,
+        tree_budget=(args.tree_budget if args.tree_budget > 0 else None),
+    )
 model.greedy_tau = args.greedy_tau
 model.soft_target_m = args.soft_target_m
 model.dense_eal_start = args.dense_eal_start
@@ -781,7 +808,8 @@ for epoch in range(start_epoch, args.num_epochs):
                 if key in metrics:
                     row[key] = metrics[key]
             for key in metrics:
-                if key.startswith("path") and key.endswith(("_eal", "_al", "_var")):
+                if (key.startswith("path") and key.endswith(("_eal", "_al", "_var"))
+                        or key.startswith("ttt")):
                     row[key] = metrics[key]
             _append_jsonl(step_log_path, row)
             extra = ""
