@@ -243,14 +243,20 @@ class ShareGPTProcessor:
                     item["id"] = f"sharegpt_{i:06d}"
                 items.append(item)
         else:
-            # Plain JSONL: avoid datasets/pyarrow schema merge failures on messy ShareGPT
+            # Plain JSON / JSONL: avoid datasets/pyarrow schema merge failures on messy ShareGPT
             raw = []
             with open(data_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    raw.append(json.loads(line))
+                head = f.read(64).lstrip()
+                f.seek(0)
+                if head.startswith("["):
+                    # One JSON array (the original ShareGPT release).
+                    raw = json.load(f)
+                else:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        raw.append(json.loads(line))
             import random
             rng = random.Random(42)
             rng.shuffle(raw)
