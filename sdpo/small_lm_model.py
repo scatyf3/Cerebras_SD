@@ -132,6 +132,32 @@ def _greedy_window_starts(draft_lg, target_argmax, mask, win_mask, gamma):
     return start
 
 
+def _rsd_sibling_accept(target_p, draft_q, k_max):
+    """P(a slot with k draft candidates is accepted) for k = 1..k_max, at every
+    position: list of k_max tensors shaped like target_p[..., 0].
+
+    Lossless sibling-by-sibling (recursive rejection) verification with the k
+    candidates drawn from q with replacement. u is the unnormalised target
+    residual and R the probability that every earlier sibling was rejected:
+        u_1 = p, R_1 = 1;  a_j = sum_v min(u_j, R_j q);
+        u_{j+1} = max(u_j - R_j q, 0);  R_{j+1} = R_j - a_j;
+        P(accepted | k) = 1 - R_{k+1}.
+    k = 1 is sum_v min(p, q), the al_tv beta. q carries the gradient through
+    both the accept mass and the residual.
+    """
+    u = target_p
+    R = torch.ones_like(draft_q[..., 0])
+    acc_by_k = []
+    for j in range(k_max):
+        Rq = R.unsqueeze(-1) * draft_q
+        a = torch.minimum(u, Rq).sum(dim=-1)
+        acc_by_k.append(1.0 - R + a)
+        if j + 1 < k_max:
+            u = torch.clamp(u - Rq, min=0.0)
+            R = R - a
+    return acc_by_k
+
+
 def _get_step_weights(scheme, n, device, dtype):
     """Per-step weights of length n for loss aggregation.
 
@@ -241,7 +267,7 @@ class SmallLMDraftModel(nn.Module):
             f"anchor must be kl|ce|eal|none, got {anchor}"
         assert aux_loss in ('none', 'v2', 'v4', 'v4_w1', 'v4eal', 'v5', 'v6', 'v7', 'v8',
                             'tv', 'eal', 'eal_w1', 'peal',
-                            'al_tv', 'al_tree', 'al_cover', 'al_greedy', 'al_greedy_wce',
+                            'al_tv', 'al_tree', 'al_tree_rsd', 'al_cover', 'al_greedy', 'al_greedy_wce',
                             'al_greedy_wce_start', 'al_greedy_margin',
                             'al_greedy_wkl', 'al_greedy_wkl_start',
                             'al_greedy_tree', 'al_greedy_tree_v4',
@@ -849,6 +875,25 @@ class SmallLMDraftModel(nn.Module):
                     keep[b, sel] = 1.0
                 w = w * keep
             aux = -(acc_length * w).sum() / w.sum().clamp(min=1e-8)
+
+        elif aux_loss == 'al_tree_rsd':
+            # Sibling-aware tree EAL at every position (no rollout): depth d of
+            # a window has k_d = altree_topk[d] siblings verified one after the
+            # other under RSD, so its factor is _rsd_sibling_accept at k_d
+            # instead of al_tree's independent 1 - (1 - beta)^k_d. Depths are
+            # conditioned on the teacher-forced prefix, as in al_tree.
+            T = prob_temperature
+            target_p_T = F.softmax(target_lg / T, dim=-1) if T != 1.0 else target_p
+            draft_q = F.softmax(draft_lg / T, dim=-1)
+            widths = [int(k) for k in getattr(self, 'altree_topk', [1] * gamma)]
+            widths = (widths + [widths[-1]] * gamma)[:gamma]
+            acc_by_k = _rsd_sibling_accept(target_p_T, draft_q, max(widths))
+            beta_stack = torch.stack(
+                [acc_by_k[widths[k] - 1][:, k:k + usable] for k in range(gamma)],
+                dim=-1)                                                  # [B, U, γ]
+            cum_prod = torch.cumprod(beta_stack, dim=-1)
+            acc_length = (cum_prod * weights).sum(dim=-1)               # [B, U]
+            aux = -(acc_length * win_mask.float()).sum() / (nv_win + 1e-8)
 
         elif aux_loss == 'al_cover':
             # One target draw per slot, siblings mutually exclusive: the slot

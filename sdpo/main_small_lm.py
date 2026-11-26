@@ -101,7 +101,7 @@ parser.add_argument('--anchor', type=str, default='kl',
 parser.add_argument('--aux_loss', type=str, default='v2',
                     choices=['none', 'v2', 'v4', 'v4_w1', 'v4eal', 'v5', 'v6', 'v7', 'v8',
                              'tv', 'eal', 'eal_w1', 'peal',
-                             'al_tv', 'al_tree', 'al_cover', 'al_greedy', 'al_greedy_wce',
+                             'al_tv', 'al_tree', 'al_tree_rsd', 'al_cover', 'al_greedy', 'al_greedy_wce',
                              'al_greedy_wce_start', 'al_greedy_margin',
                              'al_greedy_wkl', 'al_greedy_wkl_start',
                              'al_greedy_tree', 'al_greedy_tree_v4',
@@ -153,7 +153,9 @@ parser.add_argument('--wk_bonus', type=float, default=1.0,
 parser.add_argument('--altree_topk', type=str, default='4,3,2,1,1,1,1',
                     help="Branch width per depth for aux_loss='al_tree'. The "
                          'per-depth factor becomes 1-(1-beta)^k_d. All ones '
-                         'reduces exactly to al_tv.')
+                         'reduces exactly to al_tv. al_tree_rsd uses the same '
+                         'widths with the RSD sibling-by-sibling accept '
+                         'probability instead of independent siblings.')
 parser.add_argument('--greedy_tau', type=float, default=1.0,
                     help="Logit-margin temperature. al_greedy_tree uses the "
                          "k-th other logit. al_tree_greedy uses the mean of "
